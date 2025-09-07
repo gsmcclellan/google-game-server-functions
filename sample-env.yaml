@@ -1,0 +1,4 @@
+﻿INSTANCE_NAME: awesomegame-1
+ZONE: us-west1-a
+TRIGGER_TOKEN: "change-me-or-use-secret-manager"
+ALLOWED_ORIGIN: "*"
