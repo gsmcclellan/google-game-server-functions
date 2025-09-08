@@ -1,17 +1,27 @@
 ﻿import os
 import time
+import json
 from typing import Optional
+import logging
+
 from flask import Request, jsonify, make_response
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 import functions_framework
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from google.cloud.logging_v2 import Client as LoggingClient
+
+
 
 PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
-INSTANCE = os.getenv("INSTANCE_NAME")
 ZONE     = os.getenv("ZONE")
 TOKEN    = os.getenv("TRIGGER_TOKEN")
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
+
+# Structured logs to stdout in serverless (Cloud Run/Functions)
+_logging_client = LoggingClient()
+_logging_client.setup_logging()        # installs StructuredLogHandler on root
+logger = logging.getLogger(__name__)
 
 def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
@@ -27,24 +37,22 @@ def _external_ip(instance: dict) -> Optional[str]:
                 return ip
     return None
 
-@functions_framework.http
-def start_valheim(request: Request):
-    """HTTP Cloud Function.
-        Args:
-            request (flask.Request): The request object.
-            <https://flask.palletsprojects.com/en/1.1.x/api/#incoming-request-data>
-        Returns:
-            The response text, or any set of values that can be turned into a
-            Response object using `make_response`
-            <https://flask.palletsprojects.com/en/1.1.x/api/#flask.make_response>.
-        Note:
-            For more information on how Flask integrates with Cloud
-            Functions, see the `Writing HTTP functions` page.
-            <https://cloud.google.com/functions/docs/writing/http#http_frameworks>
-    """
+def log(event: str, severity: str = "INFO", **fields):
+    """Emit one-line JSON for Cloud Logging. No functional changes."""
+    fields.update({
+        "event": event,
+        "severity": severity,
+        "project": PROJECT,
+        "zone": ZONE,
+        "ts_ms": int(time.time() * 1000),
+    })
+    print(json.dumps(fields), flush=True)
 
-    # Print config
-    print(f"PROJECT={PROJECT} INSTANCE={INSTANCE} ZONE={ZONE} TOKEN={TOKEN} ALLOWED_ORIGIN={ALLOWED_ORIGIN}")
+@functions_framework.http
+def start_vm(request: Request):
+    wait = request.args.get("wait", "false").lower() == "true"
+    vm_instance = request.args.get("instance")
+    log("request.received", method=request.method, wait=wait, origin=request.headers.get("Origin"), instance=vm_instance)
 
     # CORS preflight
     if request.method == "OPTIONS":
@@ -52,28 +60,39 @@ def start_valheim(request: Request):
 
     # Optional shared-secret check (skip if TOKEN not set)
     if TOKEN and request.args.get("token") != TOKEN:
+        log("request.rejected",
+            reason=f"missing/incorrect token expected={TOKEN} received={request.args.get('token')}",
+            method=request.method,
+            wait=wait,
+            origin=request.headers.get("Origin")
+        )
         return _cors(make_response(("unauthorized", 401)))
 
-    wait = request.args.get("wait", "false").lower() == "true"
+
 
     compute = build("compute", "v1", cache_discovery=False)
 
     try:
-        inst = compute.instances().get(project=PROJECT, zone=ZONE, instance=INSTANCE).execute()
+        inst = compute.instances().get(project=PROJECT, zone=ZONE, instance=vm_instance).execute()
+        ip = _external_ip(inst)
         status = inst.get("status", "UNKNOWN")
 
         if status in ("PROVISIONING", "STAGING", "RUNNING"):
-            resp = jsonify({"started": True, "status": status, "ip": _external_ip(inst)})
+            log("instance.already_running", status=status, ip=ip, instance_id=inst.get("id"))
+            resp = jsonify({"started": True, "status": status, "ip": ip})
             return _cors(make_response(resp, 200))
 
         # Start the instance
-        op = compute.instances().start(project=PROJECT, zone=ZONE, instance=INSTANCE).execute()
+        op = compute.instances().start(project=PROJECT, zone=ZONE, instance=vm_instance).execute()
         op_name = op["name"]
+        log("compute.start.called", op=op_name)
 
         if not wait:
+            log("compute.start.accepted", op=op_name)
             resp = jsonify({"started": True, "status": "STARTING"})
             return _cors(make_response(resp, 202))
 
+        t0 = time.time()
         # Poll the zonal operation until DONE
         while True:
             o = compute.zoneOperations().get(project=PROJECT, zone=ZONE, operation=op_name).execute()
@@ -81,12 +100,18 @@ def start_valheim(request: Request):
                 break
             time.sleep(3)
 
-        # Fetch final state and IP
-        inst = compute.instances().get(project=PROJECT, zone=ZONE, instance=INSTANCE).execute()
-        resp = jsonify({"started": True, "status": inst.get("status"), "ip": _external_ip(inst)})
+        log("compute.start.done",
+            status = inst.get("status"),
+            ip = ip,
+            instance_id = inst.get("id"),
+            elapsed_ms = int((time.time() - t0) * 1000)
+        )
+
+        resp = jsonify({"started": True, "status": inst.get("status"), "ip": ip})
         return _cors(make_response(resp, 200))
 
     except HttpError as e:
+        log("compute.error", severity="ERROR", http_code=int(code), message=str(msg))
         code = getattr(e, "status_code", None) or getattr(e.resp, "status", 500)
         msg = getattr(e, "reason", str(e))
         return _cors(make_response((f"compute api error: {msg}", int(code))))
